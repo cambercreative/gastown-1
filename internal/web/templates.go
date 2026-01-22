@@ -28,15 +28,17 @@ type PolecatRow struct {
 	StatusHint   string        // Last line from pane (optional)
 }
 
-// MergeQueueRow represents a PR in the merge queue.
+// MergeQueueRow represents a merge request in the internal queue.
 type MergeQueueRow struct {
-	Number     int
-	Repo       string // Short repo name (e.g., "roxas", "gastown")
-	Title      string
-	URL        string
-	CIStatus   string // "pass", "fail", "pending"
-	Mergeable  string // "ready", "conflict", "pending"
-	ColorClass string // "mq-green", "mq-yellow", "mq-red"
+	ID          string // Bead ID (e.g., "gt-abc12")
+	Repo        string // Short rig name (e.g., "myrig")
+	Title       string // MR title (e.g., "Merge: gt-xyz99")
+	Branch      string // Source branch name
+	SourceIssue string // Original issue ID
+	Worker      string // Polecat that created the MR
+	Priority    int    // Priority level (0=highest)
+	Status      string // "ready", "blocked", "conflict"
+	ColorClass  string // "mq-green", "mq-yellow", "mq-red"
 }
 
 // ConvoyRow represents a single convoy in the dashboard.

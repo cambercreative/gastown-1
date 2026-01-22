@@ -442,7 +442,7 @@ func calculateWorkStatus(completed, total int, activityColor string) string {
 	}
 }
 
-// FetchMergeQueue fetches open PRs from registered rigs.
+// FetchMergeQueue fetches merge requests from the internal beads queue.
 func (f *LiveConvoyFetcher) FetchMergeQueue() ([]MergeQueueRow, error) {
 	// Load registered rigs from config
 	rigsConfigPath := filepath.Join(f.townRoot, "mayor", "rigs.json")
@@ -453,96 +453,65 @@ func (f *LiveConvoyFetcher) FetchMergeQueue() ([]MergeQueueRow, error) {
 
 	var result []MergeQueueRow
 
-	for rigName, entry := range rigsConfig.Rigs {
-		// Convert git URL to owner/repo format for gh CLI
-		repoPath := gitURLToRepoPath(entry.GitURL)
-		if repoPath == "" {
-			continue
-		}
-
-		prs, err := f.fetchPRsForRepo(repoPath, rigName)
+	for rigName := range rigsConfig.Rigs {
+		mrs, err := f.fetchMRsForRig(rigName)
 		if err != nil {
-			// Non-fatal: continue with other repos
+			// Non-fatal: continue with other rigs
 			continue
 		}
-		result = append(result, prs...)
+		result = append(result, mrs...)
 	}
 
 	return result, nil
 }
 
-// gitURLToRepoPath converts a git URL to owner/repo format.
-// Supports HTTPS (https://github.com/owner/repo.git) and
-// SSH (git@github.com:owner/repo.git) formats.
-func gitURLToRepoPath(gitURL string) string {
-	// Handle HTTPS format: https://github.com/owner/repo.git
-	if strings.HasPrefix(gitURL, "https://github.com/") {
-		path := strings.TrimPrefix(gitURL, "https://github.com/")
-		path = strings.TrimSuffix(path, ".git")
-		return path
-	}
-
-	// Handle SSH format: git@github.com:owner/repo.git
-	if strings.HasPrefix(gitURL, "git@github.com:") {
-		path := strings.TrimPrefix(gitURL, "git@github.com:")
-		path = strings.TrimSuffix(path, ".git")
-		return path
-	}
-
-	// Unsupported format
-	return ""
+// mrBeadResponse represents the JSON response from gt mq list.
+type mrBeadResponse struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Priority    int    `json:"priority"`
+	Labels      []string `json:"labels"`
 }
 
-// prResponse represents the JSON response from gh pr list.
-type prResponse struct {
-	Number            int    `json:"number"`
-	Title             string `json:"title"`
-	URL               string `json:"url"`
-	Mergeable         string `json:"mergeable"`
-	StatusCheckRollup []struct {
-		State      string `json:"state"`
-		Status     string `json:"status"`
-		Conclusion string `json:"conclusion"`
-	} `json:"statusCheckRollup"`
-}
-
-// fetchPRsForRepo fetches open PRs for a single repo.
-func (f *LiveConvoyFetcher) fetchPRsForRepo(repoFull, repoShort string) ([]MergeQueueRow, error) {
-	// #nosec G204 -- gh is a trusted CLI, repo is from registered rigs config
-	cmd := exec.Command("gh", "pr", "list",
-		"--repo", repoFull,
-		"--state", "open",
-		"--json", "number,title,url,mergeable,statusCheckRollup")
+// fetchMRsForRig fetches merge requests from the internal queue for a rig.
+func (f *LiveConvoyFetcher) fetchMRsForRig(rigName string) ([]MergeQueueRow, error) {
+	// #nosec G204 -- gt is a trusted CLI, rigName is from registered rigs config
+	cmd := exec.Command("gt", "mq", "list", rigName, "--json")
+	cmd.Dir = f.townRoot
 
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("fetching PRs for %s: %w", repoFull, err)
+		return nil, fmt.Errorf("fetching MRs for %s: %w", rigName, err)
 	}
 
-	var prs []prResponse
-	if err := json.Unmarshal(stdout.Bytes(), &prs); err != nil {
-		return nil, fmt.Errorf("parsing PRs for %s: %w", repoFull, err)
+	var mrs []mrBeadResponse
+	if err := json.Unmarshal(stdout.Bytes(), &mrs); err != nil {
+		return nil, fmt.Errorf("parsing MRs for %s: %w", rigName, err)
 	}
 
-	result := make([]MergeQueueRow, 0, len(prs))
-	for _, pr := range prs {
+	result := make([]MergeQueueRow, 0, len(mrs))
+	for _, mr := range mrs {
+		// Parse description to extract branch, source_issue, worker
+		branch, sourceIssue, worker := parseMRDescription(mr.Description)
+
+		// Determine status from bead data
+		status := determineMRStatus(mr)
+
 		row := MergeQueueRow{
-			Number: pr.Number,
-			Repo:   repoShort,
-			Title:  pr.Title,
-			URL:    pr.URL,
+			ID:          mr.ID,
+			Repo:        rigName,
+			Title:       mr.Title,
+			Branch:      branch,
+			SourceIssue: sourceIssue,
+			Worker:      worker,
+			Priority:    mr.Priority,
+			Status:      status,
+			ColorClass:  determineMRColorClass(status),
 		}
-
-		// Determine CI status from statusCheckRollup
-		row.CIStatus = determineCIStatus(pr.StatusCheckRollup)
-
-		// Determine mergeable status
-		row.Mergeable = determineMergeableStatus(pr.Mergeable)
-
-		// Determine color class based on overall status
-		row.ColorClass = determineColorClass(row.CIStatus, row.Mergeable)
 
 		result = append(result, row)
 	}
@@ -550,75 +519,70 @@ func (f *LiveConvoyFetcher) fetchPRsForRepo(repoFull, repoShort string) ([]Merge
 	return result, nil
 }
 
-// determineCIStatus evaluates the overall CI status from status checks.
-func determineCIStatus(checks []struct {
-	State      string `json:"state"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-}) string {
-	if len(checks) == 0 {
-		return "pending"
+// parseMRDescription extracts branch, source_issue, and worker from MR description.
+// Description format:
+//   branch: polecat/worker/issue@session
+//   target: main
+//   source_issue: issue-id
+//   rig: rigname
+//   worker: workername
+func parseMRDescription(desc string) (branch, sourceIssue, worker string) {
+	for _, line := range strings.Split(desc, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "branch:") {
+			branch = strings.TrimSpace(strings.TrimPrefix(line, "branch:"))
+		} else if strings.HasPrefix(line, "source_issue:") {
+			sourceIssue = strings.TrimSpace(strings.TrimPrefix(line, "source_issue:"))
+		} else if strings.HasPrefix(line, "worker:") {
+			worker = strings.TrimSpace(strings.TrimPrefix(line, "worker:"))
+		}
 	}
+	return
+}
 
-	hasFailure := false
-	hasPending := false
-
-	for _, check := range checks {
-		// Check conclusion first (for completed checks)
-		switch check.Conclusion {
-		case "failure", "cancelled", "timed_out", "action_required": //nolint:misspell // GitHub API returns "cancelled" (British spelling)
-			hasFailure = true
-		case "success", "skipped", "neutral":
-			// Pass
-		default:
-			// Check status for in-progress checks
-			switch check.Status {
-			case "queued", "in_progress", "waiting", "pending", "requested":
-				hasPending = true
-			}
-			// Also check state field
-			switch check.State {
-			case "FAILURE", "ERROR":
-				hasFailure = true
-			case "PENDING", "EXPECTED":
-				hasPending = true
+// determineMRStatus determines the display status for a merge request.
+func determineMRStatus(mr mrBeadResponse) string {
+	// Check for conflict indicator in description
+	if strings.Contains(mr.Description, "last_conflict_sha:") {
+		desc := mr.Description
+		idx := strings.Index(desc, "last_conflict_sha:")
+		if idx >= 0 {
+			rest := desc[idx+len("last_conflict_sha:"):]
+			rest = strings.TrimSpace(strings.Split(rest, "\n")[0])
+			if rest != "" && rest != "null" {
+				return "conflict"
 			}
 		}
 	}
 
-	if hasFailure {
-		return "fail"
+	// Check for blocking task
+	if strings.Contains(mr.Description, "conflict_task_id:") {
+		desc := mr.Description
+		idx := strings.Index(desc, "conflict_task_id:")
+		if idx >= 0 {
+			rest := desc[idx+len("conflict_task_id:"):]
+			rest = strings.TrimSpace(strings.Split(rest, "\n")[0])
+			if rest != "" && rest != "null" {
+				return "blocked"
+			}
+		}
 	}
-	if hasPending {
-		return "pending"
-	}
-	return "pass"
+
+	return "ready"
 }
 
-// determineMergeableStatus converts GitHub's mergeable field to display value.
-func determineMergeableStatus(mergeable string) string {
-	switch strings.ToUpper(mergeable) {
-	case "MERGEABLE":
-		return "ready"
-	case "CONFLICTING":
-		return "conflict"
-	default:
-		return "pending"
-	}
-}
-
-// determineColorClass determines the row color based on CI and merge status.
-func determineColorClass(ciStatus, mergeable string) string {
-	if ciStatus == "fail" || mergeable == "conflict" {
+// determineMRColorClass determines the row color based on MR status.
+func determineMRColorClass(status string) string {
+	switch status {
+	case "conflict":
 		return "mq-red"
-	}
-	if ciStatus == "pending" || mergeable == "pending" {
+	case "blocked":
+		return "mq-yellow"
+	case "ready":
+		return "mq-green"
+	default:
 		return "mq-yellow"
 	}
-	if ciStatus == "pass" && mergeable == "ready" {
-		return "mq-green"
-	}
-	return "mq-yellow"
 }
 
 // FetchPolecats fetches all running polecat and refinery sessions with activity data.
@@ -732,12 +696,12 @@ func (f *LiveConvoyFetcher) getMergeQueueCount() int {
 // getRefineryStatusHint returns appropriate status for refinery based on merge queue.
 func (f *LiveConvoyFetcher) getRefineryStatusHint(mergeQueueCount int) string {
 	if mergeQueueCount == 0 {
-		return "Idle - Waiting for PRs"
+		return "Idle - Waiting for MRs"
 	}
 	if mergeQueueCount == 1 {
-		return "Processing 1 PR"
+		return "Processing 1 MR"
 	}
-	return fmt.Sprintf("Processing %d PRs", mergeQueueCount)
+	return fmt.Sprintf("Processing %d MRs", mergeQueueCount)
 }
 
 // truncateStatusHint truncates a status hint to 60 characters with ellipsis.

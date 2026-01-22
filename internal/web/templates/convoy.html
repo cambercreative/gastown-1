@@ -380,37 +380,31 @@
         <table class="convoy-table">
             <thead>
                 <tr>
-                    <th>PR #</th>
-                    <th>Repo</th>
-                    <th>Title</th>
-                    <th>CI Status</th>
-                    <th>Mergeable</th>
+                    <th>MR ID</th>
+                    <th>Rig</th>
+                    <th>Source Issue</th>
+                    <th>Worker</th>
+                    <th>Status</th>
                 </tr>
             </thead>
             <tbody>
                 {{range .MergeQueue}}
                 <tr class="{{.ColorClass}}">
                     <td>
-                        <a href="{{.URL}}" target="_blank" class="pr-link">#{{.Number}}</a>
+                        <span class="convoy-id">{{.ID}}</span>
                     </td>
                     <td>{{.Repo}}</td>
                     <td>
-                        <span class="pr-title">{{.Title}}</span>
+                        <span class="pr-title">{{.SourceIssue}}</span>
                     </td>
+                    <td>{{.Worker}}</td>
                     <td>
-                        {{if eq .CIStatus "pass"}}
-                        <span class="ci-status ci-pass">✓ Pass</span>
-                        {{else if eq .CIStatus "fail"}}
-                        <span class="ci-status ci-fail">✗ Fail</span>
-                        {{else}}
-                        <span class="ci-status ci-pending">⏳ Pending</span>
-                        {{end}}
-                    </td>
-                    <td>
-                        {{if eq .Mergeable "ready"}}
+                        {{if eq .Status "ready"}}
                         <span class="merge-status merge-ready">Ready</span>
-                        {{else if eq .Mergeable "conflict"}}
+                        {{else if eq .Status "conflict"}}
                         <span class="merge-status merge-conflict">Conflict</span>
+                        {{else if eq .Status "blocked"}}
+                        <span class="merge-status merge-pending">Blocked</span>
                         {{else}}
                         <span class="merge-status merge-pending">Pending</span>
                         {{end}}
@@ -421,7 +415,7 @@
         </table>
         {{else}}
         <div class="empty-state-inline">
-            <p>No PRs in queue</p>
+            <p>No MRs in queue</p>
         </div>
         {{end}}
 
